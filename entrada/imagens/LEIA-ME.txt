@@ -1,0 +1,2 @@
+# Coloque aqui as imagens dos personagens geradas no Nano Banana (.png).
+# Referencie cada arquivo no roteiro.json pelo caminho relativo, ex: "imagens/personagem1.png".

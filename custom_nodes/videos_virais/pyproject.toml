@@ -1,0 +1,12 @@
+[project]
+name = "videos_virais"
+description = "Dispara a geracao de video (Wan 2.1 I2V) no Modal (A100) a partir do ComfyUI local. O ComfyUI so organiza; a GPU roda no Modal sob demanda."
+version = "0.1.0"
+license = { text = "MIT" }
+
+[project.urls]
+Repository = "local"
+
+[tool.comfy]
+DisplayName = "Videos Virais (Modal)"
+PublisherId = "local"

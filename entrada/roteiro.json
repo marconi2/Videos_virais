@@ -1,0 +1,14 @@
+{
+  "titulo": "exemplo_video",
+  "formato": "9:16",
+  "fps": 24,
+  "cenas": [
+    {
+      "id": 1,
+      "imagem": "imagens/personagem1.png",
+      "prompt_movimento": "the character slowly looks up at the sky and smiles, gentle camera push-in, subtle breeze",
+      "duracao_s": 5,
+      "narracao": "Primeira fala da narração aqui."
+    }
+  ]
+}

@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Midia e arquivos gerados (nao versionar - grandes / conteudo proprio)
+entrada/imagens/*.png
+entrada/imagens/*.jpg
+entrada/imagens/*.jpeg
+entrada/imagens/*.webp
+entrada/audio/*.mp3
+entrada/audio/*.wav
+saida/*.mp4
+saida/cenas/*.mp4
+
+# Mantem os LEIA-ME.txt das pastas (para a estrutura aparecer no repo)
+!entrada/imagens/LEIA-ME.txt
+!saida/LEIA-ME.txt
+
+# Segredos / credenciais (nunca versionar)
+*.env
+.env
+*token*
+*secret*
+.modal.toml
+
+# SO
+.DS_Store
+Thumbs.db

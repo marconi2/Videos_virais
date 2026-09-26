@@ -1,0 +1,12 @@
+{
+  "titulo": "exemplo_video",
+  "cenas": [
+    {
+      "id": 1,
+      "audio": "audio/cena_01.mp3",
+      "duracao_s": 2.69,
+      "imagem": "imagens/personagem1.png",
+      "prompt_movimento": "the character slowly looks up at the sky and smiles, gentle camera push-in, subtle breeze"
+    }
+  ]
+}

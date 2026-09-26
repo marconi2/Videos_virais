@@ -1,0 +1,366 @@
+# Videos_virais
+
+Pipeline de geração de vídeos curtos (formato viral 9:16) usando GPU sob demanda
+na nuvem (Modal), com cobrança por segundo de uso.
+
+## Visão geral da linha de produção
+
+```
+LOCAL (você)                                MODAL (nuvem, GPU serverless)
+────────────────                            ──────────────────────────────
+1. Roteiro (ChatGPT) ─────┐
+2. Imagens dos            │
+   personagens           ─┤─── upload ───►   Volume persistente (modelo já baixado)
+   (Nano Banana)          │                        │
+   -> pasta entrada/      │                   função GPU (I2V):
+                          │                     - carrega modelo de vídeo
+                          │                     - gera 1 clipe por cena
+                          │                     - (opcional) narração TTS
+                          │                     - monta vídeo final (ffmpeg)
+                          │                        │
+                          └◄──── download ──── saida/video_final.mp4
+```
+
+Vantagem sobre a tentativa anterior (Kaggle T4): a GPU da nuvem tem VRAM
+suficiente (48-80 GB) para rodar os modelos bons em fp16 sem offload, e o
+modelo fica em cache num Volume — não rebaixa a cada execução. Você paga só
+pelo tempo real de geração.
+
+## Estrutura de pastas
+
+```
+Videos_virais/
+├── README.md                # este arquivo
+├── audio_generator.py       # gera narrações (edge-tts) local + timeline.json
+├── entrada/                 # VOCÊ coloca aqui (roteiro + imagens)
+│   ├── roteiro.json         # cenas, prompts de movimento, narração
+│   ├── timeline.json        # gerado: id, áudio, duração por cena
+│   ├── audio/               # gerado: cena_XX.mp3 (narrações)
+│   └── imagens/             # personagens gerados no Nano Banana (.png)
+├── saida/                   # vídeos gerados baixam aqui
+│   └── cenas/               # clipes individuais (backup/inspeção)
+├── modal_app/               # código que roda no Modal (GPU)
+│   └── app.py               # Volume + WanRunner (I2V) + montar (ffmpeg)
+└── scripts/                 # utilitários locais (upload, run, download)
+    └── generate_video.py    # lê roteiro/timeline -> Modal -> baixa mp4
+```
+
+## Formato do roteiro (proposta — a confirmar)
+
+`entrada/roteiro.json`:
+```json
+{
+  "titulo": "meu_video",
+  "formato": "9:16",
+  "fps": 24,
+  "cenas": [
+    {
+      "id": 1,
+      "imagem": "imagens/personagem1.png",
+      "prompt_movimento": "the character slowly looks up and smiles, gentle camera push-in",
+      "duracao_s": 5,
+      "narracao": "Texto que será narrado nesta cena."
+    },
+    {
+      "id": 2,
+      "imagem": "imagens/personagem2.png",
+      "prompt_movimento": "the character raises a hand and waves, subtle motion",
+      "duracao_s": 5,
+      "narracao": "Segunda fala da narração."
+    }
+  ]
+}
+```
+
+## Decisões técnicas (V1 — TRAVADAS)
+
+| Item | Escolha |
+|------|---------|
+| Plataforma de GPU | Modal (serverless, cobrança por segundo) |
+| GPU | **A100 80GB** (reaproveitável para vários vídeos) |
+| Modelo de vídeo (I2V) | **Wan 2.1 14B I2V** (variante I2V-14B-480P) |
+| Narração | **Em off** (voz over) — edge-tts rodando LOCAL, sem GPU |
+| Lip-sync | **NÃO na V1** (personagem não fala na tela) |
+| Montagem final | ffmpeg — feita DEPOIS (áudio já pronto local) |
+| API HTTP | **NÃO na V1** — dispara via `modal run` direto |
+| ComfyUI | **NÃO na V1** — diffusers puro; avaliar depois p/ mais controle |
+
+Importante: o Wan 2.1 NÃO faz sincronização labial. Lip-sync (se um dia o
+personagem precisar falar na tela) é uma etapa separada com modelos próprios
+(LatentSync/Wav2Lip), planejada só para uma V1.5 futura.
+
+## Ordem do áudio (importante)
+
+A narração é gerada PRIMEIRO, localmente (edge-tts, sem GPU), porque a duração
+do áudio define a duração do clipe de vídeo. Fluxo:
+1. Texto da cena -> edge-tts (local) -> `cena_XX.mp3` + duração medida.
+2. Wan gera o clipe com a duração correspondente.
+3. ffmpeg junta vídeo + narração (etapa de montagem, depois).
+
+## Plano de implementação (V1)
+
+```
+FASE A — Setup
+  - Estrutura local (feito).
+  - pip install modal  ->  modal token new  (autenticação).
+  - modal_app/app.py: Volume persistente.
+
+FASE B — Provar o Wan 2.1 I2V no Modal (núcleo)
+  - Baixar Wan 2.1 I2V-14B-480P para o Volume (UMA vez).
+  - Teste I2V: imagem (Nano Banana) + prompt -> clipe 5s.
+  - Medir tempo + VRAM + custo real na A100.
+
+FASE C — Disparo local
+  - scripts/generate_video.py: lê roteiro.json + imagens -> Modal -> baixa mp4.
+
+FASE D — Áudio (local) e montagem (depois)
+  - audio_generator.py (edge-tts) gera narrações + timeline.json.
+  - ffmpeg concatena cenas + áudio no final.
+
+V2 (em andamento) — ComfyUI local orquestrando + GPU no Modal (ver abaixo).
+V3 (futuro) — agentes/automação e lip-sync (LatentSync/Wav2Lip).
+```
+
+## V2 — ComfyUI local orquestrando + GPU no Modal (DECIDIDO)
+
+Objetivo: usar o ComfyUI **instalado na máquina local** como painel de controle
+visual (organizar imagens de referência, roteiro, locução e prompts), e disparar
+a geração pesada de vídeo no Modal (A100), que **acorda sob demanda e desliga logo
+depois**. Uso no dia a dia sem abrir VS Code.
+
+### Por que este desenho (e não ComfyUI inteiro no Modal)
+
+O ComfyUI é um processo único: a UI (navegador) fala com um backend Python que
+precisa da GPU. Não dá para separar "UI local" de "GPU remota" de forma nativa —
+os nós de sampling rodam no mesmo processo do backend. As opções eram:
+
+- **A) ComfyUI inteiro no Modal, UI no navegador local.** Funciona, mas a A100
+  fica de pé (e faturando) o tempo TODO em que a UI está aberta, mesmo ociosa.
+  Rejeitada por custo.
+- **B) ComfyUI local só organiza; vídeo é gerado no Modal por chamada.** ← ESCOLHIDA.
+  A GPU só liga no instante do render e desliga sozinha. Custo de batch, igual ao
+  `app.py` atual. É o melhor custo-benefício.
+- **C) ComfyUI local com GPU local.** Descartada (VRAM insuficiente — foi o motivo
+  de abandonar o Kaggle T4).
+
+### Divisão de trabalho (leve = local, pesado = Modal)
+
+```
+PC LOCAL (ComfyUI, SEM GPU forte — só organiza)      MODAL (A100 só no clique)
+──────────────────────────────────────────────      ──────────────────────────
+- imagens de referência                              nó "Gerar no Modal":
+- roteiro (cenas, prompts de movimento)   ── pacote ─► - acorda a A100
+- locução edge-tts -> timeline.json          (imgs +   - WanRunner.gerar_lote
+- monta o "pacote" da geração                roteiro + - montar (ffmpeg 9:16)
+                                             áudios)   - GPU desliga sozinha
+                                                    ◄── mp4 pronto ───
+```
+
+Os nós de organização são CPU/IO (não precisam de GPU). O passo de vídeo é um
+**nó customizado** do ComfyUI que **chama a função Modal** já existente
+(`modal_app/app.py` → `WanRunner.gerar_lote` + `montar`). O ComfyUI NÃO terceiriza
+um KSampler para o Modal; ele apenas dispara a função remota e recebe o mp4. Não há
+preview do vídeo sendo sampleado ao vivo — chega o mp4 pronto quando o Modal termina.
+
+### Controle de custo da A100 (freios OBRIGATÓRIOS)
+
+A A100 só deve faturar durante o render. Freios a embutir no app Modal:
+
+| Freio | Valor | Para quê |
+|-------|-------|----------|
+| `scaledown_window` | curto (~120s) | derruba o container após ociosidade → para de cobrar |
+| `timeout` | 1–2h | trava de segurança: nunca fica ligado além disso |
+| `max_containers` | 1 | nunca sobe várias A100 em paralelo por engano |
+| `modal app stop` | manual | encerrar explicitamente ao terminar |
+
+Consequência aceita: quando a GPU dorme, a PRÓXIMA geração recarrega o Wan (alguns
+segundos a ~1-2 min). É o preço de não pagar GPU parada — comportamento desejado.
+
+### Modelo de uso (dia a dia)
+
+| Tarefa | Precisa de VS Code? |
+|--------|---------------------|
+| Gerar vídeo no dia a dia | Não — só ComfyUI no navegador (`localhost:8188`) → Queue Prompt |
+| Iniciar o ComfyUI | Não é VS Code, mas é "ligar o ComfyUI" (ícone/comando) |
+| Autenticar o Modal (`modal token new`) | Uma vez só; só repete se o token expirar |
+| Mudar parâmetros/modelo/lógica do script | Sim — aí sim mexer no código |
+
+### Plano de implementação (V2)
+
+```
+FASE V2-A — Instalar ComfyUI local (em andamento pelo usuário)
+  - Confirmar: caminho da instalação + tipo (Desktop .exe ou manual/portable).
+  - Localizar a subpasta custom_nodes/.
+
+FASE V2-B — Nó customizado "Videos Virais -> Gerar no Modal"
+  - Criar ComfyUI/custom_nodes/videos_virais/ que chama modal_app/app.py.
+  - Reaproveita Volume + WanRunner + montar já existentes.
+  - Requer Modal autenticado na máquina (modal token new — uma vez).
+
+FASE V2-C — Grafo no ComfyUI
+  - imagem -> prompt_movimento -> áudio (edge-tts) -> nó "Gerar no Modal" -> mp4.
+  - Queue Prompt: acorda A100, gera lote, monta, baixa; GPU desliga sozinha.
+```
+
+Recomendação registrada: validar primeiro o fluxo ponta a ponta como comando único
+(reusando `audio_generator.py` + `scripts/generate_video.py`) e SÓ DEPOIS empacotar
+como nó de ComfyUI, para não travar na criação do nó antes de provar o essencial.
+
+### Custom node — IMPLEMENTADO (como instalar e usar)
+
+O node vive DENTRO do projeto (versionado junto), em:
+```
+custom_nodes/videos_virais/
+├── __init__.py       # expõe os nós ao ComfyUI
+├── nodes.py          # lógica: dispara o Modal via subprocesso
+└── pyproject.toml    # metadados (ComfyUI Manager)
+```
+
+Ele NÃO importa `modal` dentro do ComfyUI. Em vez disso, dispara um subprocesso
+chamando o Python global da máquina (que tem `modal` instalado e autenticado):
+`C:\Python313\python.exe -m modal run scripts/generate_video.py [args]`. Assim a
+`.venv` isolada do ComfyUI Desktop não é tocada.
+
+Ambiente desta máquina (verificado):
+- ComfyUI **portable**: `C:\ComfyUI\` (`.bat` de inicialização) e código em
+  `C:\ComfyUI\ComfyUI\`. Python embarcado em `C:\ComfyUI\python_embeded\python.exe`.
+  (A versão Desktop foi ELIMINADA — dava problema de reinstalação; ver histórico.)
+- GPU Intel → não roda Wan 14B local; inicie com `run_cpu.bat` (o ComfyUI só
+  organiza e dispara o Modal, então CPU basta).
+- Python global com Modal autenticado: `C:\Python313\python.exe`.
+- Volume `videos-virais-modelos` já contém o Wan 2.1 I2V-14B-480P completo.
+
+Instalação no ComfyUI (feita via junction — reflete edições automaticamente):
+```
+mklink /J "C:\ComfyUI\ComfyUI\custom_nodes\videos_virais" "C:\Users\Taty\Desktop\Videos_virais\custom_nodes\videos_virais"
+```
+(alternativa: copiar a pasta `custom_nodes/videos_virais/` para dentro do
+`custom_nodes/` do ComfyUI — mas aí precisa recopiar a cada edição.)
+
+Os dois nós (categoria "Videos Virais" no menu do ComfyUI):
+1. Config (projeto + Python) — já vem com os caminhos autodetectados.
+2. Gerar no Modal (A100) — parâmetros steps/fps/guidance/montar_final.
+   Ligue a saída `config` do nó 1 na entrada `config` do nó 2. Saídas do nó 2:
+   `caminho_mp4` (caminho do vídeo final) e `log` (saída do Modal).
+
+Fluxo de uso no dia a dia:
+1. Coloque imagens em `entrada/imagens/` e edite `entrada/roteiro.json`.
+2. (Locução) rode `python audio_generator.py` para gerar áudios + `timeline.json`.
+   (Isso ainda é fora do ComfyUI nesta versão; pode virar um nó depois.)
+3. Abra o ComfyUI (`localhost:8188`), monte o grafo Config → Gerar no Modal.
+4. Queue Prompt: o node acorda a A100, gera, monta, baixa o mp4 em `saida/`, e a
+   GPU do Modal desliga sozinha. O caminho do arquivo aparece na saída do nó.
+
+Pré-requisito único (uma vez): Modal autenticado na máquina (`modal token new`).
+Nesta máquina já está autenticado (profile `marconijs`).
+
+## V-futuro — avaliar upgrade de modelo (registrado)
+
+O V1 usa **Wan 2.1 I2V-14B-480P** (open source, Alibaba), já instalado no Volume e
+validado. Pesquisa de mercado (2025/2026) indica que ele foi SUPERADO pela própria
+sequência e por concorrentes open source. Quando fizer sentido dar upgrade de
+qualidade, avaliar:
+
+| Candidato | Destaque | VRAM aprox. | Observação |
+|-----------|----------|-------------|------------|
+| **Wan 2.2** (Alibaba) | Melhor da familia hoje; fotorrealismo superior | ~27 GB | Mesma linhagem do 2.1 → migração pequena no `app.py`. A100 80GB sobra. |
+| **HunyuanVideo 1.5** (Tencent) | Melhor qualidade/VRAM; roda em placa menor | ~14 GB | Poderia até baratear a GPU. |
+| **LTX-2 / LTX-2.5** (Lightricks) | Mais rápido, clipes longos, gera áudio junto | varia | Muda o pipeline (áudio nativo). |
+
+Notas:
+- **Seedance (ByteDance)** é FECHADO/proprietário (só via API paga) — nunca roda no
+  nosso Modal; serve só como referência de qualidade a mirar. Specs de uma suposta
+  "Seedance 2.5" não confirmadas (fontes documentam Seedance 1.0, menção a 2.0).
+- Nenhum open source empata 100% com os fechados top (Seedance/Sora/Veo/Kling), mas
+  Wan 2.2 e LTX-2.x já são descritos como rivalizando com Sora/Veo em realismo.
+- Recomendacao: manter Wan 2.1 por ora (instalado + validado); migrar para Wan 2.2
+  quando quiser upgrade — é a evolução natural e de menor esforço.
+
+### Dois rumos futuros (DECIDIDO fazer após validar a config atual)
+
+Há dois caminhos DIFERENTES de evolução, com esforço bem distinto:
+
+**Rumo A — Upgrade de qualidade (fácil):** trocar Wan 2.1 I2V → **Wan 2.2 I2V** base.
+Mesmo caso de uso (imagem parada + prompt de texto → vídeo; o modelo INVENTA o
+movimento). Migração pequena no `app.py`. A100 80GB sobra.
+
+**Rumo B — Novas capacidades (projeto à parte):** adicionar variantes que usam um
+VÍDEO de referência para COPIAR movimento:
+- **Wan 2.2 VACE** — video-to-video / reference-to-video: anima uma imagem seguindo
+  o movimento/pose de um vídeo (motion transfer, dança).
+- **Wan 2.2 Animate** — transfere movimento + expressões faciais (com lip-sync) de um
+  "driving video" para um personagem; o modo **Replace** faz character/object SWAP
+  (troca a pessoa do vídeo pelo seu personagem, mantendo movimento e cenário).
+
+Diferença crítica: o I2V atual NÃO usa vídeo de referência (inventa o movimento do
+texto). VACE/Animate USAM um vídeo de referência (copiam o movimento). São MODELOS
+DIFERENTES no Volume + pipeline novo no `app.py` + entrada de vídeo grande (subir
+para o Volume, não mandar embutido na chamada). Muito útil para "vídeos virais"
+(pegar uma trend/dança e colocar o personagem).
+
+Plano: modelos separados no Volume, chamados sob demanda conforme o caso de cada
+vídeo (I2V puro / motion transfer / swap).
+
+### Estratégia de armazenamento (custo do Volume) — DECIDIDO
+
+Storage do Modal é custo FIXO mensal (~US$ 0,15/GB/mês de referência — CONFIRMAR
+valor atual no pricing), cobrado tenha ou não geração. Cada modelo 14B ocupa ~35 GB
+(~US$ 5/mês cada). Download roda em CPU (sem A100), rápido e baratíssimo: ~3–10 min
+por modelo (banda HF↔Modal), custo desprezível.
+
+Matemática: 35 GB residente ≈ US$ 0,0073/hora (~1 centavo/h). Só compensa excluir e
+rebaixar se o modelo for de uso RARO (o storage economizado supera o incômodo do
+download só após muitos dias parado).
+
+Estratégia HÍBRIDA adotada:
+- **Wan 2.2 I2V (uso frequente, "pão com manteiga"):** deixar RESIDENTE no Volume
+  (~US$ 5/mês). Sem espera de download no dia a dia.
+- **Wan 2.2 VACE / Animate (uso ocasional — trends/dança/swap):** baixar SOB DEMANDA
+  quando for gerar aquele tipo de vídeo, e EXCLUIR depois. Storage zero para eles;
+  paga-se apenas ~3–10 min de download na hora do uso.
+
+Comparativo de custo mensal de storage:
+- Só Wan 2.1 hoje (~35 GB): ~US$ 5/mês.
+- Os 3 modelos residentes (~120 GB): ~US$ 18/mês.
+- Híbrido (I2V residente + VACE/Animate sob demanda): ~US$ 5/mês. ← escolhido.
+
+Implementação futura no `app.py` (Rumo B): parametrizar `download_model` por modelo
+e adicionar `delete_model` (o `download_model` atual já é ~90% disso). Assim dá para
+gerenciar "baixar/usar/excluir" sob demanda sem mexer em código a cada vez.
+
+NÃO fazer agora: só ao iniciar o Rumo B (após validar a config atual). Até lá, fica
+só o Wan 2.1 residente.
+
+## Laboratório de aprendizado — ComfyUI + Flux no Kaggle (GRÁTIS)
+
+Ambiente de TREINO paralelo, separado do Modal, para aprender o PROCESSO do ComfyUI
+(montar workflow, nós, sampler, prompts) gerando IMAGENS com Flux na GPU T4 grátis
+do Kaggle. A lógica aprendida transfere quase inteira para o vídeo (Wan) no Modal.
+
+Por que Kaggle e não local nem Modal:
+- PC local tem GPU Intel → não roda modelos pesados; serve só para a interface.
+- Modal (A100) é caro para os MUITOS testes do aprendizado.
+- Kaggle dá 2x T4 (16 GB cada, usa 1) GRÁTIS (~30h/semana) → ótimo para treinar
+  com Flux FP8 (imagem). NÃO roda Wan 14B (T4 pequena) — vídeo continua só no Modal.
+
+Como funciona (arquitetura): o ComfyUI roda DENTRO do notebook Kaggle (backend +
+T4), e você acessa a interface pelo navegador via túnel cloudflared. É "hospedado
+no Kaggle, operado do seu navegador". NÃO dá para o ComfyUI local usar a T4 remota
+(o ComfyUI não separa UI de GPU; e o Kaggle, ao contrário do Modal, não expõe função
+remota chamável por código).
+
+Arquivos do laboratório (neste projeto):
+- `kaggle_comfyui_flux.md` — guia passo a passo, célula por célula (didático).
+- `kaggle_setup_unico.md` — UMA célula que faz tudo (ComfyUI + Manager + Flux FP8 +
+  túnel), idempotente. Uso no dia a dia. Troque o HF_TOKEN antes de rodar.
+
+Pré-requisitos: conta Kaggle com telefone verificado (libera GPU); token de leitura
+do HuggingFace; aceitar a licença do FLUX.1-dev no HF (uma vez).
+
+Limitação-chave do Kaggle: `/kaggle/working` é APAGADO ao desligar a sessão. Nada
+persiste sozinho. Soluções: (a) rodar a célula única de setup a cada sessão (rebaixa
+~17 GB, alguns min); (b) futuramente, salvar modelos como Kaggle Dataset (storage
+permanente, anexado ao notebook, carrega instantâneo). Adotado (a) por ora.
+
+Modelo usado: Flux.1-dev FP8 (checkpoint único all-in-one, repo `Comfy-Org/flux1-dev`),
+que cabe nos ~15 GB da T4. Se faltar VRAM, cair para Flux GGUF Q4 (~6-8 GB).

@@ -75,7 +75,10 @@ def baixar_flux():
 
 
 def baixar_epicrealism():
-    destino = CKPT_DIR + "/epicrealism.safetensors"
+    # Nome oficial do modelo (versao com VAE embutido) — e o nome que os
+    # workflows prontos do epiCRealism procuram. Manter assim evita erro de
+    # "checkpoint ausente" ao abrir workflows compartilhados.
+    destino = CKPT_DIR + "/epicrealism_naturalSinRC1VAE.safetensors"
     if os.path.exists(destino):
         print(">> epiCRealism ja existe")
         return

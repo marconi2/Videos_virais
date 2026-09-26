@@ -353,6 +353,37 @@ Arquivos do laboratório (neste projeto):
 - `kaggle_comfyui_flux.md` — guia passo a passo, célula por célula (didático).
 - `kaggle_setup_unico.md` — UMA célula que faz tudo (ComfyUI + Manager + Flux FP8 +
   túnel), idempotente. Uso no dia a dia. Troque o HF_TOKEN antes de rodar.
+- `kaggle_setup.py` — MESMO setup como script Python (ComfyUI + Manager + Flux +
+  epiCRealism + túnel). RECOMENDADO: evita erro de copy-paste no Kaggle.
+
+### Forma recomendada de rodar (via GitHub — sem copiar código longo)
+
+O projeto está versionado no GitHub: **https://github.com/marconi2/Videos_virais**
+(público). O `kaggle_setup.py` é baixado e executado por UMA linha curta, então você
+nunca cola código grande no Kaggle (o que causava SyntaxError/IndentationError).
+
+No Kaggle (GPU T4 x2 + Internet On), apenas DUAS células curtas:
+
+Célula 1 (tokens — ficam só no Kaggle, nunca no GitHub):
+```
+import os
+os.environ["HF_TOKEN"] = "hf_seu_token_aqui"
+os.environ["CIVITAI_TOKEN"] = "sua_chave_civitai_aqui"
+```
+
+Célula 2 (baixa e roda o setup):
+```
+!wget -q https://raw.githubusercontent.com/marconi2/Videos_virais/main/kaggle_setup.py -O setup.py && python setup.py
+```
+
+Ciclo de manutenção: para mudar o setup (novo modelo/node), edita-se `kaggle_setup.py`
+no projeto → commit + push → no Kaggle roda a MESMA linha (pega a versão nova). Os
+tokens nunca vão para o repositório (lidos de `os.environ`).
+
+Modelos configurados no script: Flux FP8 (`Comfy-Org/flux1-dev`) e epiCRealism
+(Civitai modelVersionId 143906, SD 1.5). Cada workflow usa o modelo compatível com
+sua arquitetura (workflow Flux usa Flux; workflow SD 1.5 usa epiCRealism — NÃO são
+intercambiáveis no mesmo grafo).
 
 Pré-requisitos: conta Kaggle com telefone verificado (libera GPU); token de leitura
 do HuggingFace; aceitar a licença do FLUX.1-dev no HF (uma vez).

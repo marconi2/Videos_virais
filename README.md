@@ -395,3 +395,27 @@ permanente, anexado ao notebook, carrega instantâneo). Adotado (a) por ora.
 
 Modelo usado: Flux.1-dev FP8 (checkpoint único all-in-one, repo `Comfy-Org/flux1-dev`),
 que cabe nos ~15 GB da T4. Se faltar VRAM, cair para Flux GGUF Q4 (~6-8 GB).
+
+## V-futuro — narração: avaliar F5-TTS PT-BR (registrado)
+
+Hoje a narração usa **edge-tts** (LOCAL, CPU, grátis, vozes prontas da Microsoft —
+NÃO clona voz). Candidato de upgrade quando formos trabalhar no Modal:
+
+**F5-TTS** (repo oficial `SWivid/F5-TTS`) — TTS moderno (Diffusion Transformer +
+flow matching) com **clonagem de voz zero-shot** (clona uma voz a partir de poucos
+segundos de áudio de referência). Um dos TTS open source mais avançados.
+
+Fine-tunes PT-BR (COMUNIDADE, não oficiais — qualidade varia, VERIFICAR na hora):
+- `Tharyck/multispeaker-ptbr-f5tts` — multilocutor brasileiro (parece o mais completo).
+- `firstpixel/F5-TTS-pt-br`, `fuuuzzy/F5-TTS-pt-br` — pesos PT-BR (alguns "preliminares").
+- `ModelsLab/F5-tts-brazilian` — outra variante brasileira.
+
+Diferença crítica de arquitetura (impacto na decisão):
+- **edge-tts (atual):** roda LOCAL sem GPU, grátis, mas voz genérica (não clona).
+- **F5-TTS:** clona voz (narração personalizada), MAS precisa de GPU → rodaria no
+  MODAL, não local. Ou seja, muda o fluxo: a narração deixaria de ser "local sem
+  GPU" e passaria a ser mais um passo no Modal (mais VRAM/tempo/custo por vídeo).
+
+Quando avaliar: só se quiser NARRAÇÃO COM VOZ CLONADA/personalizada. Para voz over
+genérica, o edge-tts atual já resolve de graça. Decidir custo-benefício na hora
+(edge-tts grátis-local vs. F5-TTS melhor-mas-no-Modal).

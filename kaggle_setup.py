@@ -1,53 +1,68 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import argparse
-import html
+"""
+COMFYUI KAGGLE SETUP
+--------------------
+Bootstrap seguro para ComfyUI no Kaggle.
+
+- Reconhece symlinks existentes.
+- Preserva modelos e Custom Nodes.
+- Prepara ComfyUI_Persistent sem apagar conteúdo.
+- Trata arquivos ocupando o lugar de diretórios com backup.
+- Não usa resolve() para validar caminhos internos ao ComfyUI.
+- Instala dependências, Manager e cloudflared.
+- Pode ser importado para usar download_url(), baixar_civitai()
+  e instalar_custom_node().
+"""
+
+from __future__ import annotations
+
 import os
 import re
 import shutil
+import signal
 import socket
 import subprocess
 import sys
 import time
 import urllib.request
 from pathlib import Path
-from urllib.parse import unquote, urlparse
+from typing import Optional
+
 
 # ============================================================
 # CONFIGURAÇÃO
 # ============================================================
 
-WORKING = Path("/kaggle/working")
-COMFY = WORKING / "ComfyUI"
+COMFY = Path("/kaggle/working/ComfyUI")
+PERSIST = Path("/kaggle/working/ComfyUI_Persistent")
+CLOUDFLARED = Path("/kaggle/working/cloudflared")
 
-# NÃO apagar nem recriar esta pasta.
-PERSIST_ROOT = WORKING / "ComfyUI_Persistent"
-PERSIST_MODELS = PERSIST_ROOT / "models"
-PERSIST_NODES = PERSIST_ROOT / "custom_nodes"
-PERSIST_INPUT = PERSIST_ROOT / "input"
-PERSIST_OUTPUT = PERSIST_ROOT / "output"
+COMFY_PORT = 8188
+COMFY_LOG = Path("/kaggle/working/comfyui.log")
 
-MODELS = COMFY / "models"
-CUSTOM_NODES = COMFY / "custom_nodes"
-INPUT_DIR = COMFY / "input"
-OUTPUT_DIR = COMFY / "output"
+PERSIST_DIRS = (
+    "models",
+    "custom_nodes",
+    "input",
+    "output",
+)
 
-MANAGER_DIR = CUSTOM_NODES / "ComfyUI-Manager"
-CLOUDFLARED = WORKING / "cloudflared"
-
-COMFY_REPO = "https://github.com/comfyanonymous/ComfyUI.git"
 MANAGER_REPO = "https://github.com/ltdrdata/ComfyUI-Manager.git"
 
-COMFY_HOST = "127.0.0.1"
-COMFY_PORT = 8188
 
 # ============================================================
-# UTILITÁRIOS
+# UTILIDADES
 # ============================================================
 
-def run(cmd, cwd=None, check=True, capture=False):
-    print(">>", " ".join(map(str, cmd)))
+def log(msg: str = "") -> None:
+    print(msg, flush=True)
+
+
+def run(cmd, *, cwd: Optional[Path] = None, check: bool = True,
+        capture: bool = False):
+    log(f">> {' '.join(map(str, cmd))}")
     return subprocess.run(
         [str(x) for x in cmd],
         cwd=str(cwd) if cwd else None,
@@ -57,491 +72,385 @@ def run(cmd, cwd=None, check=True, capture=False):
     )
 
 
-def safe_mkdir(path):
-    Path(path).mkdir(parents=True, exist_ok=True)
+def download_file(url: str, destino: Path,
+                  headers: Optional[dict] = None) -> None:
+    destino.parent.mkdir(parents=True, exist_ok=True)
+
+    req = urllib.request.Request(
+        url,
+        headers=headers or {"User-Agent": "Mozilla/5.0"},
+    )
+
+    with urllib.request.urlopen(req) as response, open(destino, "wb") as f:
+        shutil.copyfileobj(response, f)
 
 
-def arquivo_valido(path):
+def safe_backup_path(path: Path) -> Path:
+    base = path.with_name(path.name + ".backup")
+    if not base.exists() and not base.is_symlink():
+        return base
+
+    i = 1
+    while True:
+        candidate = path.with_name(f"{path.name}.backup_{i}")
+        if not candidate.exists() and not candidate.is_symlink():
+            return candidate
+        i += 1
+
+
+def arquivo_tem_tamanho(path: Path, minimo: int = 1024) -> bool:
     try:
-        return path.exists() and path.is_file() and path.stat().st_size > 0
+        return path.is_file() and path.stat().st_size >= minimo
     except OSError:
         return False
 
 
-def caminho_dentro_comfy(relativo):
-    """
-    Valida o caminho lexicalmente, sem usar resolve() para a contenção.
+# ============================================================
+# CAMINHO DENTRO DO COMFYUI
+# ============================================================
 
-    ComfyUI/models e outras pastas podem ser symlinks para
-    ComfyUI_Persistent. Usar resolve() aqui faria um caminho válido
-    parecer estar fora do ComfyUI.
+def caminho_dentro_comfy(relativo: str) -> Path:
+    """
+    Validação lexical.
+
+    Não usa resolve() para validar o caminho, porque COMFYUI contém
+    symlinks para ComfyUI_Persistent.
     """
     relativo = (relativo or "").strip().lstrip("/\\")
 
     if not relativo:
         return COMFY.absolute()
 
-    partes = Path(relativo).parts
-    if any(parte == ".." for parte in partes):
+    parts = Path(relativo).parts
+
+    if any(part == ".." for part in parts):
         raise ValueError(f"Pasta inválida: {relativo}")
 
-    raiz = COMFY.absolute()
-    destino = (COMFY / relativo).absolute()
+    candidato = COMFY / relativo
+    raiz_abs = COMFY.absolute()
+    candidato_abs = candidato.absolute()
 
     try:
-        destino.relative_to(raiz)
-    except ValueError as e:
-        raise ValueError(f"Pasta inválida: {relativo}") from e
+        candidato_abs.relative_to(raiz_abs)
+    except ValueError:
+        raise ValueError(f"Pasta inválida: {relativo}")
 
-    return destino
+    return candidato_abs
 
 
 # ============================================================
-# COMFYUI / DEPENDÊNCIAS
+# SYMLINK / PERSISTÊNCIA
 # ============================================================
 
-def garantir_comfy_aimdo():
+def same_target(a: Path, b: Path) -> bool:
+    """Compara destinos reais apenas para validar symlinks."""
+    try:
+        return a.resolve(strict=True) == b.resolve(strict=True)
+    except (FileNotFoundError, OSError):
+        return False
+
+
+def migrar_conteudo(origem: Path, destino: Path) -> None:
     """
-    Tenta importar primeiro.
-    Só instala comfy-aimdo se realmente estiver faltando.
+    Migra conteúdo de uma pasta REAL para o persistente.
+
+    Nunca é chamado sobre um symlink válido.
+    Nunca sobrescreve um item já existente no destino.
     """
-
-    try:
-        import comfy_aimdo  # noqa: F401
-        print(">> comfy-aimdo já instalado")
-        return
-    except ImportError:
-        print(">> comfy-aimdo ausente. Instalando...")
-
-    run([
-        sys.executable,
-        "-m",
-        "pip",
-        "install",
-        "comfy-aimdo",
-    ])
-
-    try:
-        import comfy_aimdo  # noqa: F401
-        print(">> comfy-aimdo instalado com sucesso")
-    except ImportError as e:
-        raise RuntimeError(
-            "comfy-aimdo foi instalado, mas ainda não pode ser importado."
-        ) from e
-
-
-def instalar_dependencias_comfyui():
-    requirements = COMFY / "requirements.txt"
-
-    if not requirements.exists():
-        raise FileNotFoundError(
-            f"requirements.txt não encontrado: {requirements}"
-        )
-
-    print(">> Verificando/reinstalando dependências do ComfyUI...")
-
-    run([
-        sys.executable,
-        "-m",
-        "pip",
-        "install",
-        "-r",
-        requirements,
-    ])
-
-    garantir_comfy_aimdo()
-
-
-def instalar_comfyui():
-    if not COMFY.exists():
-        print(">> ComfyUI não existe. Clonando...")
-        run(["git", "clone", COMFY_REPO, COMFY])
-    else:
-        print(">> ComfyUI já existe")
-
-    instalar_dependencias_comfyui()
-
-
-# ============================================================
-# PERSISTÊNCIA
-# ============================================================
-
-def migrar_conteudo(origem, destino):
-    origem = Path(origem)
-    destino = Path(destino)
-
-    if not origem.exists() or origem.is_symlink():
+    if not origem.exists() or origem.is_symlink() or not origem.is_dir():
         return
 
-    safe_mkdir(destino)
+    destino.mkdir(parents=True, exist_ok=True)
 
-    for item in origem.iterdir():
-        alvo = destino / item.name
+    for item in list(origem.iterdir()):
+        destino_item = destino / item.name
 
-        if alvo.exists():
+        if destino_item.exists() or destino_item.is_symlink():
+            log(f"   ⏭️ Já existe no persistente: {item.name}")
             continue
 
-        print(f">> Migrando: {item} -> {alvo}")
-        shutil.move(str(item), str(alvo))
+        try:
+            shutil.move(str(item), str(destino_item))
+            log(f"   📦 Migrado: {item.name}")
+        except Exception as e:
+            log(f"   ⚠️ Não foi possível migrar {item.name}: {e}")
 
 
-def substituir_por_symlink(origem, destino):
-    origem = Path(origem)
-    destino = Path(destino)
+def preparar_diretorio_persistente(nome: str) -> None:
+    """
+    Prepara models/custom_nodes/input/output.
 
-    safe_mkdir(destino)
+    Regras:
+    - symlink correto: preserva;
+    - diretório normal: migra conteúdo e transforma em symlink;
+    - arquivo no lugar da pasta: faz backup e cria symlink;
+    - symlink incorreto/quebrado: faz backup do link e cria o correto;
+    - nunca apaga o conteúdo do destino persistente.
+    """
+    origem = COMFY / nome
+    destino = PERSIST / nome
 
+    log(f"\n--- {nome} ---")
+    log(f"Origem:   {origem}")
+    log(f"Destino:  {destino}")
+
+    destino.mkdir(parents=True, exist_ok=True)
+
+    # 1. Symlink existente
     if origem.is_symlink():
         try:
-            if origem.resolve() == destino.resolve():
+            if same_target(origem, destino):
+                log("   🔗 Symlink correto já existe. Preservado.")
                 return
-        except OSError:
-            pass
-        origem.unlink()
 
-    elif origem.exists():
-        if origem.is_dir():
-            migrar_conteudo(origem, destino)
-            shutil.rmtree(origem)
-        else:
-            origem.unlink()
+            alvo = origem.readlink()
+            log(f"   ⚠️ Symlink aponta para outro destino: {alvo}")
 
-    origem.parent.mkdir(parents=True, exist_ok=True)
-    origem.symlink_to(destino, target_is_directory=True)
+            backup = safe_backup_path(origem)
+            origem.rename(backup)
+            log(f"   📦 Symlink antigo preservado em: {backup}")
 
+            origem.symlink_to(destino, target_is_directory=True)
+            log("   🔗 Novo symlink criado.")
+            return
 
-def preparar_armazenamento_persistente():
-    """
-    Preserva integralmente os dados existentes em ComfyUI_Persistent.
-    """
+        except OSError as e:
+            log(f"   ⚠️ Symlink quebrado/inacessível: {e}")
 
-    for pasta in [
-        PERSIST_ROOT,
-        PERSIST_MODELS,
-        PERSIST_NODES,
-        PERSIST_INPUT,
-        PERSIST_OUTPUT,
-    ]:
-        safe_mkdir(pasta)
+            backup = safe_backup_path(origem)
+            origem.rename(backup)
+            log(f"   📦 Symlink preservado em: {backup}")
 
-    migrar_conteudo(MODELS, PERSIST_MODELS)
-    migrar_conteudo(CUSTOM_NODES, PERSIST_NODES)
-    migrar_conteudo(INPUT_DIR, PERSIST_INPUT)
-    migrar_conteudo(OUTPUT_DIR, PERSIST_OUTPUT)
+            origem.symlink_to(destino, target_is_directory=True)
+            log("   🔗 Novo symlink criado.")
+            return
 
-    substituir_por_symlink(MODELS, PERSIST_MODELS)
-    substituir_por_symlink(CUSTOM_NODES, PERSIST_NODES)
-    substituir_por_symlink(INPUT_DIR, PERSIST_INPUT)
-    substituir_por_symlink(OUTPUT_DIR, PERSIST_OUTPUT)
+    # 2. Diretório normal
+    if origem.exists() and origem.is_dir():
+        log("   📁 Diretório normal encontrado.")
+        migrar_conteudo(origem, destino)
 
-    print(">> Armazenamento persistente preparado:")
-    print(">> Modelos :", PERSIST_MODELS)
-    print(">> Nodes   :", PERSIST_NODES)
-    print(">> Input   :", PERSIST_INPUT)
-    print(">> Output  :", PERSIST_OUTPUT)
+        try:
+            origem.rmdir()
+            log("   🧹 Diretório vazio removido.")
+        except OSError as e:
+            raise RuntimeError(
+                f"O diretório {origem} ainda contém arquivos após a "
+                f"migração. Nada foi apagado. Detalhe: {e}"
+            ) from e
 
-
-# ============================================================
-# DATASET DE MODELOS DO KAGGLE
-# ============================================================
-
-def descobrir_dataset_modelos():
-    """
-    Procura em /kaggle/input um Dataset contendo models/checkpoints.
-    Retorna o diretório models do primeiro Dataset compatível.
-    """
-    input_root = Path("/kaggle/input")
-    if not input_root.exists():
-        return None
-
-    candidatos = []
-    for item in sorted(input_root.iterdir()):
-        models_dir = item / "models"
-        checkpoints = models_dir / "checkpoints"
-        if models_dir.is_dir() and checkpoints.is_dir():
-            candidatos.append(models_dir)
-
-    if not candidatos:
-        return None
-
-    return candidatos[0]
-
-
-def configurar_dataset_modelos():
-    """
-    Configura o ComfyUI para ler modelos grandes diretamente do Dataset
-    privado montado em /kaggle/input, sem copiá-los para o Working.
-    """
-    models_root = descobrir_dataset_modelos()
-
-    if not models_root:
-        print(">> Nenhum Dataset de modelos encontrado em /kaggle/input")
-        return None
-
-    config = COMFY / "extra_model_paths.yaml"
-
-    categorias = [
-        "checkpoints", "configs", "loras", "vae", "text_encoders",
-        "clip", "clip_vision", "diffusion_models", "unet",
-        "style_models", "embeddings", "diffusers", "vae_approx",
-        "controlnet", "gligen", "upscale_models",
-        "latent_upscale_models", "hypernetworks", "photomaker",
-        "model_patches", "audio_encoders", "background_removal",
-        "frame_interpolation", "geometry_estimation", "optical_flow",
-        "detection",
-    ]
-
-    linhas = [
-        "# Gerado automaticamente pelo kaggle_setup.py",
-        "# Modelos grandes ficam no Dataset e não são copiados para /kaggle/working.",
-        "comfyui:",
-        f"    base_path: {models_root}",
-        "    is_default: true",
-    ]
-
-    adicionadas = []
-    for categoria in categorias:
-        pasta = models_root / categoria
-        if pasta.is_dir():
-            linhas.append(f"    {categoria}: {categoria}")
-            adicionadas.append(categoria)
-
-    config.write_text("\n".join(linhas) + "\n", encoding="utf-8")
-
-    print(">> Dataset de modelos detectado:", models_root)
-    print(">> extra_model_paths.yaml configurado:", config)
-    print(">> Pastas externas:", ", ".join(adicionadas) or "checkpoints")
-    return models_root
-
-
-def espaco_livre_em_working():
-    try:
-        return shutil.disk_usage(WORKING).free
-    except OSError:
-        return 0
-
-
-def verificar_espaco_download(tamanho_bytes=0, margem_mb=512):
-    """Evita iniciar download que possa lotar o Working."""
-    livre = espaco_livre_em_working()
-    margem = margem_mb * 1024 * 1024
-    necessario = int(tamanho_bytes or 0) + margem
-
-    if tamanho_bytes and livre < necessario:
-        raise OSError(
-            "Espaço insuficiente no /kaggle/working. "
-            f"Necessário aproximadamente {necessario / 1024**3:.2f} GB "
-            f"(incluindo margem), disponível {livre / 1024**3:.2f} GB."
-        )
-
-    print(
-        f">> Espaço livre no Working: {livre / 1024**3:.2f} GB"
-        + (f" | download estimado: {tamanho_bytes / 1024**3:.2f} GB" if tamanho_bytes else "")
-    )
-
-
-def tamanho_url(url):
-    """Tenta descobrir Content-Length sem baixar o arquivo."""
-    try:
-        req = urllib.request.Request(url, method="HEAD", headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=30) as response:
-            valor = response.headers.get("Content-Length")
-            return int(valor) if valor and valor.isdigit() else None
-    except Exception:
-        return None
-
-
-# ============================================================
-# MANAGER
-# ============================================================
-
-def instalar_manager():
-    safe_mkdir(CUSTOM_NODES)
-
-    if MANAGER_DIR.exists():
-        print(">> Manager já existe")
+        origem.symlink_to(destino, target_is_directory=True)
+        log("   🔗 Symlink criado.")
         return
 
-    print(">> Instalando ComfyUI-Manager...")
-    run(["git", "clone", MANAGER_REPO, MANAGER_DIR])
+    # 3. Arquivo no lugar da pasta
+    if origem.exists():
+        log("   ⚠️ Existe um ARQUIVO onde deveria haver uma pasta.")
+        backup = safe_backup_path(origem)
+        origem.rename(backup)
+        log(f"   📦 Arquivo preservado em: {backup}")
 
-    requirements = MANAGER_DIR / "requirements.txt"
+        origem.symlink_to(destino, target_is_directory=True)
+        log("   🔗 Symlink criado.")
+        return
+
+    # 4. Não existe
+    origem.symlink_to(destino, target_is_directory=True)
+    log("   🔗 Symlink criado.")
+
+
+def preparar_armazenamento_persistente() -> None:
+    log("\n" + "=" * 70)
+    log("💾 PREPARANDO ARMAZENAMENTO PERSISTENTE")
+    log("=" * 70)
+
+    COMFY.mkdir(parents=True, exist_ok=True)
+    PERSIST.mkdir(parents=True, exist_ok=True)
+
+    for nome in PERSIST_DIRS:
+        preparar_diretorio_persistente(nome)
+
+    log("\n✅ Armazenamento persistente preparado.")
+
+
+def validar_armazenamento() -> bool:
+    log("\n" + "=" * 70)
+    log("🔍 VALIDANDO ARMAZENAMENTO")
+    log("=" * 70)
+
+    ok = True
+
+    for nome in PERSIST_DIRS:
+        origem = COMFY / nome
+        destino = PERSIST / nome
+
+        if not origem.exists():
+            log(f"❌ {origem} não existe.")
+            ok = False
+            continue
+
+        if not origem.is_symlink():
+            log(f"❌ {origem} não é symlink.")
+            ok = False
+            continue
+
+        if not destino.exists() or not destino.is_dir():
+            log(f"❌ Destino persistente inválido: {destino}")
+            ok = False
+            continue
+
+        if not same_target(origem, destino):
+            log(f"❌ Symlink incorreto: {origem}")
+            ok = False
+            continue
+
+        log(f"✅ {nome}: symlink correto.")
+
+    return ok
+
+
+# ============================================================
+# COMFYUI
+# ============================================================
+
+def instalar_comfyui() -> None:
+    if (COMFY / "main.py").exists():
+        log(">> ComfyUI já existe.")
+        return
+
+    log(">> Clonando ComfyUI...")
+    run([
+        "git", "clone", "--depth", "1",
+        "https://github.com/comfyanonymous/ComfyUI.git",
+        str(COMFY),
+    ])
+
+
+def garantir_comfy_aimdo() -> None:
+    try:
+        import comfy_aimdo  # noqa: F401
+        log(">> comfy-aimdo já instalado")
+        return
+    except ImportError:
+        pass
+
+    log(">> Instalando comfy-aimdo...")
+    run([
+        sys.executable, "-m", "pip", "install", "-q", "comfy-aimdo"
+    ])
+
+
+def instalar_dependencias_comfyui() -> None:
+    requirements = COMFY / "requirements.txt"
 
     if requirements.exists():
+        log("\n📦 Verificando/instalando dependências do ComfyUI...")
         run([
             sys.executable,
             "-m",
             "pip",
             "install",
             "-r",
-            requirements,
+            str(requirements),
         ])
+    else:
+        log("⚠️ requirements.txt não encontrado.")
+
+    garantir_comfy_aimdo()
+
+
+def instalar_manager() -> None:
+    manager = COMFY / "custom_nodes" / "ComfyUI-Manager"
+
+    if manager.exists():
+        log(">> ComfyUI-Manager já instalado.")
+        return
+
+    log(">> Instalando ComfyUI-Manager...")
+    run([
+        "git", "clone", "--depth", "1",
+        MANAGER_REPO,
+        str(manager),
+    ])
 
 
 # ============================================================
 # DOWNLOADS
 # ============================================================
 
-def nome_da_url(url):
-    nome = Path(urlparse(url).path).name
-    return nome or "download.bin"
+def nome_de_url(url: str) -> str:
+    url_sem_query = url.split("?", 1)[0].split("#", 1)[0]
+    nome = Path(url_sem_query).name
+
+    if not nome:
+        raise ValueError(
+            f"Não foi possível descobrir o nome do arquivo: {url}"
+        )
+
+    return nome
 
 
-def baixar_url(url, pasta, nome=None):
-    destino_dir = caminho_dentro_comfy(pasta)
-    safe_mkdir(destino_dir)
+def download_url(
+    url: str,
+    pasta_relativa: str,
+    nome_arquivo: Optional[str] = None,
+) -> Path:
+    """Download genérico para qualquer pasta dentro do ComfyUI."""
+    destino_dir = caminho_dentro_comfy(pasta_relativa)
+    destino_dir.mkdir(parents=True, exist_ok=True)
 
-    nome = nome or nome_da_url(url)
+    nome = nome_arquivo or nome_de_url(url)
     destino = destino_dir / nome
 
-    if arquivo_valido(destino):
-        print(f">> Arquivo já existe: {destino}")
+    if arquivo_tem_tamanho(destino):
+        log(f"⏭️ Já existe, não baixando novamente: {destino}")
         return destino
 
-    print(">> URL:", url)
-    print(">> Destino:", destino)
+    log(f"⬇️ Baixando: {url}")
+    log(f"   Destino: {destino}")
 
-    tamanho = tamanho_url(url)
-    verificar_espaco_download(tamanho)
+    download_file(url, destino)
 
-    temporario = destino.with_suffix(destino.suffix + ".part")
+    if not arquivo_tem_tamanho(destino):
+        raise RuntimeError(f"Download aparentemente inválido: {destino}")
 
-    try:
-        urllib.request.urlretrieve(url, temporario)
-        temporario.replace(destino)
-    except Exception:
-        try:
-            temporario.unlink()
-        except OSError:
-            pass
-        raise
-
-    print(">> Download concluído:", destino)
+    log(f"✅ Download concluído: {destino}")
     return destino
 
 
-# ============================================================
-# CIVITAI
-# ============================================================
-
-def extrair_model_id_civitai(link):
-    match = re.search(r"civitai\.com/models/(\d+)", link)
-
-    if not match:
-        raise ValueError(
-            "Não foi possível encontrar o ID do modelo Civitai."
-        )
-
-    return match.group(1)
-
-
-def nome_content_disposition(response):
-    cd = response.headers.get("Content-Disposition", "")
-
-    match = re.search(
-        r"filename\*=UTF-8''([^;]+)",
-        cd,
-        flags=re.IGNORECASE,
-    )
-
-    if match:
-        return unquote(match.group(1)).strip('"')
-
-    match = re.search(
-        r'filename="?([^";]+)"?',
-        cd,
-        flags=re.IGNORECASE,
-    )
-
-    if match:
-        return match.group(1).strip()
-
-    return None
-
-
-def baixar_civitai(link, pasta, nome=None):
+def baixar_civitai(
+    url: str,
+    pasta_relativa: str,
+    nome_arquivo: Optional[str] = None,
+) -> Path:
+    """Download usando CIVITAI_TOKEN."""
     token = os.environ.get("CIVITAI_TOKEN", "").strip()
 
     if not token:
         raise RuntimeError("CIVITAI_TOKEN não configurado.")
 
-    model_id = extrair_model_id_civitai(link)
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "User-Agent": "Mozilla/5.0",
+    }
 
-    url = (
-        f"https://civitai.com/api/download/models/"
-        f"{model_id}?token={token}"
-    )
+    destino_dir = caminho_dentro_comfy(pasta_relativa)
+    destino_dir.mkdir(parents=True, exist_ok=True)
 
-    destino_dir = caminho_dentro_comfy(pasta)
-    safe_mkdir(destino_dir)
+    nome = nome_arquivo or nome_de_url(url)
+    destino = destino_dir / nome
 
-    if nome:
-        destino = destino_dir / nome
-        if arquivo_valido(destino):
-            print(f">> Arquivo já existe: {destino}")
-            return destino
+    if arquivo_tem_tamanho(destino):
+        log(f"⏭️ Civitai: arquivo já existe: {destino}")
+        return destino
 
-    print(f">> Baixando Civitai modelo {model_id}...")
+    log(f"⬇️ Baixando Civitai: {url}")
+    download_file(url, destino, headers=headers)
 
-    request = urllib.request.Request(
-        url,
-        headers={"User-Agent": "Mozilla/5.0"},
-    )
+    if not arquivo_tem_tamanho(destino):
+        raise RuntimeError(f"Download Civitai inválido: {destino}")
 
-    with urllib.request.urlopen(request) as response:
-        nome_header = nome_content_disposition(response)
-        nome_final = (
-            nome or nome_header or f"civitai_model_{model_id}.bin"
-        )
-
-        destino = destino_dir / nome_final
-
-        if arquivo_valido(destino):
-            print(f">> Arquivo já existe: {destino}")
-            return destino
-
-        total = response.headers.get("Content-Length")
-        total = int(total) if total and total.isdigit() else None
-        verificar_espaco_download(total)
-
-        temporario = destino.with_suffix(destino.suffix + ".part")
-
-        try:
-            with open(temporario, "wb") as f:
-                baixado = 0
-
-                while True:
-                    bloco = response.read(1024 * 1024)
-
-                    if not bloco:
-                        break
-
-                    f.write(bloco)
-                    baixado += len(bloco)
-
-                    if total:
-                        pct = baixado * 100 / total
-                        print(
-                            f"\r>> {pct:6.2f}% "
-                            f"({baixado / 1024 / 1024:.1f} MB / "
-                            f"{total / 1024 / 1024:.1f} MB)",
-                            end="",
-                            flush=True,
-                        )
-
-            if total:
-                print()
-
-            temporario.replace(destino)
-
-        except Exception:
-            try:
-                temporario.unlink()
-            except OSError:
-                pass
-            raise
-
-    print(">> Download Civitai concluído:", destino)
+    log(f"✅ Civitai concluído: {destino}")
     return destino
 
 
@@ -549,672 +458,354 @@ def baixar_civitai(link, pasta, nome=None):
 # CUSTOM NODES
 # ============================================================
 
-def nome_repo_git(url):
-    nome = url.rstrip("/").split("/")[-1]
+def instalar_custom_node(
+    repo_url: str,
+    nome: Optional[str] = None,
+) -> Path:
+    """Instala um Custom Node no diretório persistente via symlink."""
+    nodes_dir = caminho_dentro_comfy("custom_nodes")
+    nodes_dir.mkdir(parents=True, exist_ok=True)
 
-    if nome.endswith(".git"):
-        nome = nome[:-4]
+    repo_name = nome or repo_url.rstrip("/").split("/")[-1]
+    if repo_name.endswith(".git"):
+        repo_name = repo_name[:-4]
 
-    if not nome:
-        raise ValueError("Nome do repositório inválido.")
-
-    return nome
-
-
-def instalar_node(url):
-    safe_mkdir(CUSTOM_NODES)
-
-    nome = nome_repo_git(url)
-    destino = CUSTOM_NODES / nome
+    destino = nodes_dir / repo_name
 
     if destino.exists():
-        print(f">> Custom Node já existe: {destino}")
+        log(f"⏭️ Custom Node já existe: {repo_name}")
         return destino
 
-    print(">> Instalando Custom Node:", url)
+    log(f"🧩 Instalando Custom Node: {repo_url}")
 
-    run(["git", "clone", url, destino])
+    run([
+        "git", "clone", "--depth", "1",
+        repo_url,
+        str(destino),
+    ])
 
-    requirements = destino / "requirements.txt"
-
-    if requirements.exists():
-        run([
-            sys.executable,
-            "-m",
-            "pip",
-            "install",
-            "-r",
-            requirements,
-        ])
-
-    print(">> Custom Node instalado:", destino)
+    log(f"✅ Custom Node instalado: {destino}")
     return destino
 
 
 # ============================================================
-# MODELOS PADRÃO
+# PROCESSOS
 # ============================================================
 
-def instalar_modelos_padrao():
-    flux_url = os.environ.get("DEFAULT_FLUX_URL", "").strip()
-    epic_link = os.environ.get(
-        "DEFAULT_EPICREALISM_CIVITAI",
-        ""
-    ).strip()
+def pids_comfyui() -> list[int]:
+    try:
+        result = subprocess.run(
+            ["pgrep", "-f", r"/ComfyUI/main\.py"],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            return []
 
-    if flux_url:
-        try:
-            baixar_url(
-                flux_url,
-                "models/checkpoints",
-            )
-        except Exception as e:
-            print("!! Erro no Flux padrão:", e)
-    else:
-        print(">> Flux: nenhuma URL padrão configurada")
+        return [
+            int(line.strip())
+            for line in result.stdout.splitlines()
+            if line.strip().isdigit()
+        ]
+    except Exception:
+        return []
 
-    if epic_link:
+
+def parar_comfyui() -> None:
+    pids = pids_comfyui()
+
+    if not pids:
+        return
+
+    log(f"🛑 Parando ComfyUI: {pids}")
+
+    for pid in pids:
         try:
-            baixar_civitai(
-                epic_link,
-                "models/checkpoints",
-            )
-        except Exception as e:
-            print("!! Erro no epiCRealism padrão:", e)
-    else:
-        print(">> epiCRealism: nenhuma URL padrão configurada")
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+
+    for _ in range(20):
+        if not pids_comfyui():
+            return
+        time.sleep(0.5)
+
+    for pid in pids_comfyui():
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+
+def pids_cloudflared() -> list[int]:
+    try:
+        result = subprocess.run(
+            ["pgrep", "-x", "cloudflared"],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            return []
+
+        return [
+            int(line.strip())
+            for line in result.stdout.splitlines()
+            if line.strip().isdigit()
+        ]
+    except Exception:
+        return []
+
+
+def parar_cloudflared() -> None:
+    pids = pids_cloudflared()
+
+    if not pids:
+        return
+
+    log(f"🛑 Parando Cloudflare anterior: {pids}")
+
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+
+    for _ in range(20):
+        if not pids_cloudflared():
+            return
+        time.sleep(0.5)
+
+    for pid in pids_cloudflared():
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
 
 
 # ============================================================
 # CLOUDFLARED
 # ============================================================
 
-def cloudflared_esta_executando():
-    """
-    Verifica se existe processo cloudflared.
-    Retorna lista de PIDs.
-    """
-
-    resultado = subprocess.run(
-        ["pgrep", "-x", "cloudflared"],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-
-    if resultado.returncode != 0:
-        return []
-
-    pids = []
-
-    for linha in resultado.stdout.splitlines():
-        linha = linha.strip()
-
-        if linha.isdigit():
-            pids.append(int(linha))
-
-    return pids
-
-
-def parar_cloudflared():
-    """
-    Se houver Cloudflare executando, encerra para criar
-    um túnel novo e obter uma nova URL.
-    """
-
-    pids = cloudflared_esta_executando()
-
-    if not pids:
-        print(">> Nenhum cloudflared em execução.")
-        return
-
-    print(">> Cloudflared em execução:", pids)
-    print(">> Encerrando para criar um novo túnel...")
-
-    for pid in pids:
+def garantir_cloudflared() -> Path:
+    if CLOUDFLARED.exists():
         try:
-            os.kill(pid, 15)
-        except ProcessLookupError:
-            pass
-        except PermissionError:
-            pass
+            CLOUDFLARED.chmod(0o755)
 
-    # Aguarda encerramento.
-    for _ in range(20):
-        if not cloudflared_esta_executando():
-            break
-        time.sleep(0.5)
+            teste = subprocess.run(
+                [str(CLOUDFLARED), "--version"],
+                capture_output=True,
+                text=True,
+            )
 
-    # Se ainda houver processo, força.
-    restantes = cloudflared_esta_executando()
-
-    for pid in restantes:
-        try:
-            os.kill(pid, 9)
-        except (ProcessLookupError, PermissionError):
+            if teste.returncode == 0:
+                log(">> cloudflared já está instalado.")
+                return CLOUDFLARED
+        except Exception:
             pass
 
-
-def reparar_cloudflared():
-    """
-    Corrige o executável existente.
-    Se estiver ausente ou inutilizável, baixa novamente.
-
-    A ComfyUI_Persistent NÃO é tocada.
-    """
+        backup = safe_backup_path(CLOUDFLARED)
+        log(f"⚠️ cloudflared inválido. Preservando em {backup}")
+        CLOUDFLARED.rename(backup)
 
     url = (
         "https://github.com/cloudflare/cloudflared/releases/latest/"
         "download/cloudflared-linux-amd64"
     )
 
-    if CLOUDFLARED.exists():
-        print(">> cloudflared já existe")
-        print(">> Aplicando chmod +x sempre...")
+    log(">> Baixando cloudflared...")
+    download_file(url, CLOUDFLARED)
+    CLOUDFLARED.chmod(0o755)
 
-        try:
-            os.chmod(CLOUDFLARED, 0o755)
-        except Exception as e:
-            print("!! chmod falhou:", e)
-
-        if os.access(CLOUDFLARED, os.X_OK):
-            try:
-                resultado = subprocess.run(
-                    [str(CLOUDFLARED), "--version"],
-                    capture_output=True,
-                    text=True,
-                    check=False,
-                )
-
-                if resultado.returncode == 0:
-                    print(">> cloudflared executável e funcionando.")
-                    print(">>", resultado.stdout.strip())
-                    return CLOUDFLARED
-
-            except Exception:
-                pass
-
-        print("!! cloudflared existente não está utilizável.")
-        print(">> Baixando uma cópia nova...")
-
-    temporario = WORKING / "cloudflared.download"
-
-    try:
-        if temporario.exists():
-            temporario.unlink()
-
-        urllib.request.urlretrieve(url, temporario)
-        os.chmod(temporario, 0o755)
-
-        if CLOUDFLARED.exists():
-            CLOUDFLARED.unlink()
-
-        temporario.rename(CLOUDFLARED)
-        os.chmod(CLOUDFLARED, 0o755)
-
-    except Exception:
-        try:
-            temporario.unlink()
-        except OSError:
-            pass
-        raise
-
-    if not os.access(CLOUDFLARED, os.X_OK):
-        raise PermissionError(
-            f"cloudflared não está executável: {CLOUDFLARED}"
-        )
-
-    print(">> cloudflared corrigido:", CLOUDFLARED)
-
-    return CLOUDFLARED
-
-
-def testar_cloudflared(cf):
-    resultado = subprocess.run(
-        [str(cf), "--version"],
+    teste = subprocess.run(
+        [str(CLOUDFLARED), "--version"],
         capture_output=True,
         text=True,
-        check=False,
     )
 
-    if resultado.returncode != 0:
-        print(resultado.stdout)
-        print(resultado.stderr)
+    if teste.returncode != 0:
         raise RuntimeError(
-            "cloudflared não conseguiu executar."
+            "cloudflared baixado não executou corretamente."
         )
 
-    print(">>", resultado.stdout.strip())
-
-
-# ============================================================
-# COMFYUI
-# ============================================================
-
-def comfyui_esta_executando():
-    resultado = subprocess.run(
-        ["pgrep", "-f", r"/ComfyUI/main\.py"],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-
-    if resultado.returncode != 0:
-        return []
-
-    pids = []
-
-    for linha in resultado.stdout.splitlines():
-        linha = linha.strip()
-        if linha.isdigit():
-            pids.append(int(linha))
-
-    return pids
-
-
-def parar_comfyui():
-    pids = comfyui_esta_executando()
-
-    if not pids:
-        print(">> Nenhum ComfyUI antigo em execução.")
-        return
-
-    print(">> ComfyUI em execução:", pids)
-    print(">> Encerrando para iniciar uma sessão limpa...")
-
-    for pid in pids:
-        try:
-            os.kill(pid, 15)
-        except (ProcessLookupError, PermissionError):
-            pass
-
-    for _ in range(20):
-        if not comfyui_esta_executando():
-            break
-        time.sleep(0.5)
-
-    restantes = comfyui_esta_executando()
-
-    for pid in restantes:
-        try:
-            os.kill(pid, 9)
-        except (ProcessLookupError, PermissionError):
-            pass
-
-
-def esperar_porta(host, port, processo, timeout=90):
-    inicio = time.time()
-
-    while time.time() - inicio < timeout:
-
-        if processo.poll() is not None:
-            return False
-
-        sock = socket.socket(
-            socket.AF_INET,
-            socket.SOCK_STREAM
-        )
-        sock.settimeout(0.5)
-
-        try:
-            sock.connect((host, port))
-            return True
-        except OSError:
-            time.sleep(1)
-        finally:
-            sock.close()
-
-    return False
-
-
-# ============================================================
-# BOTÃO HTML
-# ============================================================
-
-def mostrar_botao_url(url):
-    try:
-        from IPython.display import display, HTML
-
-        url_html = html.escape(url, quote=True)
-
-        display(
-            HTML(
-                f"""
-                <div style="
-                    margin: 20px 0;
-                    padding: 22px;
-                    border: 2px solid #22c55e;
-                    border-radius: 14px;
-                    background: #f0fdf4;
-                    text-align: center;
-                    max-width: 750px;
-                ">
-
-                    <div style="
-                        font-size: 24px;
-                        font-weight: 700;
-                        margin-bottom: 16px;
-                    ">
-                        🚀 ComfyUI Online
-                    </div>
-
-                    <a
-                        href="{url_html}"
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        style="
-                            display: inline-block;
-                            padding: 15px 32px;
-                            background: #16a34a;
-                            color: #ffffff !important;
-                            text-decoration: none;
-                            border-radius: 9px;
-                            font-size: 18px;
-                            font-weight: 700;
-                            cursor: pointer;
-                        "
-                    >
-                        🔗 ABRIR COMFYUI
-                    </a>
-
-                    <div style="
-                        margin-top: 16px;
-                        padding: 10px;
-                        font-size: 14px;
-                        word-break: break-all;
-                        background: #ffffff;
-                        border-radius: 7px;
-                    ">
-                        {url_html}
-                    </div>
-
-                </div>
-                """
-            )
-        )
-
-    except Exception as e:
-        print("!! Falha ao renderizar botão:", e)
-        print("URL:", url)
+    log("✅ cloudflared pronto.")
+    return CLOUDFLARED
 
 
 # ============================================================
 # SERVIDOR + TÚNEL
 # ============================================================
 
-def subir_servidor_e_tunel(cf):
-    # Sempre reinicia processos existentes.
+def porta_aberta(host: str, port: int) -> bool:
+    sock = socket.socket()
+    sock.settimeout(1)
+
+    try:
+        sock.connect((host, port))
+        return True
+    except OSError:
+        return False
+    finally:
+        sock.close()
+
+
+def subir_servidor_e_tunel(cf: Path) -> None:
+    log("\n" + "=" * 70)
+    log("🚀 INICIANDO COMFYUI")
+    log("=" * 70)
+
     parar_cloudflared()
     parar_comfyui()
 
-    # Sempre garante a permissão.
-    os.chmod(cf, 0o755)
+    cf.chmod(0o755)
 
-    if not os.access(cf, os.X_OK):
-        raise PermissionError(
-            f"cloudflared sem permissão de execução: {cf}"
-        )
+    log(">> Iniciando ComfyUI...")
 
-    print(">> Subindo ComfyUI...")
+    log_file = open(COMFY_LOG, "w", encoding="utf-8")
 
-    log_file = WORKING / "comfyui.log"
-
-    log = open(
-        log_file,
-        "w",
-        encoding="utf-8",
-    )
-
-    comfy = subprocess.Popen(
+    processo_comfy = subprocess.Popen(
         [
             sys.executable,
             str(COMFY / "main.py"),
             "--listen",
-            COMFY_HOST,
+            "127.0.0.1",
             "--port",
             str(COMFY_PORT),
         ],
         cwd=str(COMFY),
-        stdout=log,
+        stdout=log_file,
         stderr=subprocess.STDOUT,
+        start_new_session=True,
     )
 
-    print(">> PID ComfyUI:", comfy.pid)
+    log(f"   PID ComfyUI: {processo_comfy.pid}")
+    log(f"   Log: {COMFY_LOG}")
 
-    if not esperar_porta(
-        COMFY_HOST,
-        COMFY_PORT,
-        comfy,
-        timeout=90,
-    ):
-        log.flush()
+    pronto = False
 
-        try:
-            texto = log_file.read_text(
-                encoding="utf-8",
-                errors="replace",
+    for _ in range(90):
+        if processo_comfy.poll() is not None:
+            raise RuntimeError(
+                f"ComfyUI encerrou durante a inicialização. "
+                f"Consulte {COMFY_LOG}"
             )
-        except Exception:
-            texto = ""
 
-        print("\n==========================================")
-        print("❌ COMFYUI NÃO INICIOU")
-        print("==========================================")
-        print(texto[-8000:])
+        if porta_aberta("127.0.0.1", COMFY_PORT):
+            pronto = True
+            break
 
+        time.sleep(1)
+
+    if not pronto:
         raise RuntimeError(
-            f"ComfyUI não iniciou. Log: {log_file}"
+            f"ComfyUI não abriu a porta {COMFY_PORT} em 90 segundos. "
+            f"Consulte {COMFY_LOG}"
         )
 
-    print(
-        f">> ComfyUI online em "
-        f"http://{COMFY_HOST}:{COMFY_PORT}"
-    )
+    log("✅ ComfyUI está respondendo.")
+    log(">> Iniciando Cloudflare Tunnel...")
 
-    print(">> Criando novo Cloudflare Tunnel...")
-
-    tun = subprocess.Popen(
+    processo_cf = subprocess.Popen(
         [
             str(cf),
             "tunnel",
             "--url",
-            f"http://{COMFY_HOST}:{COMFY_PORT}",
+            f"http://127.0.0.1:{COMFY_PORT}",
             "--no-autoupdate",
         ],
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
         bufsize=1,
+        start_new_session=True,
     )
 
-    print(">> PID Cloudflare:", tun.pid)
-
-    url = None
+    url_tunel = None
     inicio = time.time()
+    padrao = re.compile(
+        r"https://[a-zA-Z0-9.-]+\.trycloudflare\.com"
+    )
 
     while time.time() - inicio < 60:
-
-        linha = tun.stdout.readline()
-
-        if not linha:
-            if tun.poll() is not None:
-                break
-
-            time.sleep(0.2)
-            continue
-
-        linha = linha.strip()
-
-        if linha:
-            print("[cloudflared]", linha)
-
-        encontrado = re.search(
-            r"https://[a-zA-Z0-9.-]+\.trycloudflare\.com",
-            linha,
-        )
-
-        if encontrado:
-            url = encontrado.group(0)
+        if processo_cf.poll() is not None:
             break
 
-    if not url:
-        print("\n==========================================")
-        print("❌ URL DO CLOUDFLARE NÃO ENCONTRADA")
-        print("==========================================")
+        linha = processo_cf.stdout.readline()
 
-        if tun.poll() is not None:
-            print(
-                "Cloudflared encerrou com código:",
-                tun.returncode,
-            )
+        if linha:
+            print(linha.rstrip())
 
+            encontrado = padrao.search(linha)
+            if encontrado:
+                url_tunel = encontrado.group(0)
+                break
+        else:
+            time.sleep(0.2)
+
+    if not url_tunel:
+        log("⚠️ URL automática do Cloudflare não foi encontrada.")
+        log("Consulte a saída acima para diagnóstico.")
         return
 
-    print("\n==========================================")
-    print("🚀 COMFYUI ONLINE")
-    print("==========================================")
-    print(url)
-    print("==========================================")
+    log("\n" + "=" * 70)
+    log("🌐 COMFYUI ONLINE")
+    log("=" * 70)
+    log(f"URL: {url_tunel}")
 
-    # Botão HTML clicável no Kaggle.
-    mostrar_botao_url(url)
+    try:
+        from IPython.display import HTML, display
 
+        html = f"""
+        <div style="margin:15px 0;">
+            <a href="{url_tunel}" target="_blank"
+               style="
+               display:inline-block;
+               padding:12px 20px;
+               background:#222;
+               color:white;
+               border-radius:8px;
+               text-decoration:none;
+               font-weight:bold;">
+                🚀 ABRIR COMFYUI
+            </a>
+        </div>
+        """
 
-# ============================================================
-# ARGUMENTOS
-# ============================================================
-
-def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Setup completo do ComfyUI para Kaggle."
-    )
-
-    parser.add_argument(
-        "--repair",
-        action="store_true",
-        help="Corrige dependências, comfy-aimdo e cloudflared.",
-    )
-
-    parser.add_argument(
-        "--civitai",
-        help="Link de página de modelo Civitai.",
-    )
-
-    parser.add_argument(
-        "--download",
-        help="URL direta de arquivo/modelo.",
-    )
-
-    parser.add_argument(
-        "--pasta",
-        help="Pasta destino relativa ao ComfyUI.",
-    )
-
-    parser.add_argument(
-        "--nome",
-        help="Nome opcional do arquivo.",
-    )
-
-    parser.add_argument(
-        "--node",
-        help="URL GitHub de Custom Node.",
-    )
-
-    parser.add_argument(
-        "--no-server",
-        action="store_true",
-        help="Não iniciar ComfyUI nem Cloudflare.",
-    )
-
-    parser.add_argument(
-        "--skip-default-models",
-        action="store_true",
-        help="Não baixar modelos padrão.",
-    )
-
-    return parser.parse_args()
+        display(HTML(html))
+    except Exception:
+        pass
 
 
 # ============================================================
 # MAIN
 # ============================================================
 
-def main():
-    args = parse_args()
+def main() -> None:
+    log("\n" + "=" * 70)
+    log("COMFYUI KAGGLE SETUP")
+    log("=" * 70)
 
-    print("\n==========================================")
-    print(" COMFYUI KAGGLE SETUP")
-    print("==========================================\n")
-
-    # 1. ComfyUI + dependências
     instalar_comfyui()
+    instalar_dependencias_comfyui()
 
-    # 2. Persistência
     preparar_armazenamento_persistente()
 
-    # 3. Dataset externo de modelos
-    configurar_dataset_modelos()
+    if not validar_armazenamento():
+        raise RuntimeError(
+            "A estrutura persistente não passou na validação."
+        )
 
-    # 4. Manager
     instalar_manager()
 
-    # 5. Modo repair
-    if args.repair:
-        print("\n>> Modo --repair")
-        parar_cloudflared()
-        cf = reparar_cloudflared()
-        testar_cloudflared(cf)
-
-        print("\n==========================================")
-        print("✅ REPARO CONCLUÍDO")
-        print("==========================================")
-        print("ComfyUI_Persistent foi preservada.")
-        return
-
-    # 5. Modelos padrão
-    if not args.skip_default_models:
-        instalar_modelos_padrao()
-
-    # 6. Civitai
-    if args.civitai:
-        if not args.pasta:
-            raise ValueError("--civitai exige --pasta.")
-
-        baixar_civitai(
-            args.civitai,
-            args.pasta,
-            args.nome,
-        )
-
-    # 7. URL direta
-    if args.download:
-        if not args.pasta:
-            raise ValueError("--download exige --pasta.")
-
-        baixar_url(
-            args.download,
-            args.pasta,
-            args.nome,
-        )
-
-    # 8. Custom Node
-    if args.node:
-        instalar_node(args.node)
-
-    # 9. Sem servidor
-    if args.no_server:
-        print(
-            "\n>> --no-server ativo. "
-            "Servidor não iniciado."
-        )
-        return
-
-    # 10. Corrigir/verificar Cloudflare
-    cf = reparar_cloudflared()
-    testar_cloudflared(cf)
-
-    # 11. Reiniciar ComfyUI + Cloudflare
+    cf = garantir_cloudflared()
     subir_servidor_e_tunel(cf)
+
+    log("\n" + "=" * 70)
+    log("✅ SETUP FINALIZADO")
+    log("=" * 70)
+    log("Modelos existentes preservados.")
+    log("Custom Nodes existentes preservados.")
+    log("Armazenamento persistente ativo.")
+    log("=" * 70)
 
 
 if __name__ == "__main__":

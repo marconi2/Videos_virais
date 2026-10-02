@@ -38,8 +38,11 @@ CKPT_WORKING = COMFY + "/models/checkpoints"          # gravavel (download na ho
 CLOUDFLARED = "/kaggle/working/cloudflared"
 
 # Nome do Dataset de modelos (ajuste se usar outro nome ao criar o Dataset).
-# Quando anexado, o Kaggle monta em /kaggle/input/<slug-do-dataset>/
-DATASET_DIR = "/kaggle/input/comfyui-models"
+# O caminho real dentro de /kaggle/input varia (ex.: /kaggle/input/comfyui-models/
+# ou /kaggle/input/datasets/<user>/comfyui-models/comfyui-models/). Por isso o
+# script DETECTA automaticamente a pasta que contem 'checkpoints' (ver
+# detectar_dataset_base), em vez de depender de um caminho fixo.
+DATASET_DIR = ""  # preenchido em runtime por detectar_dataset_base()
 
 
 # --------------------------------------------------------------------------- #
@@ -90,6 +93,24 @@ def instalar_manager():
 # --------------------------------------------------------------------------- #
 # Apontar o ComfyUI para os modelos do Dataset (SEM copiar — read-only)
 # --------------------------------------------------------------------------- #
+def detectar_dataset_base():
+    """Procura dentro de /kaggle/input a pasta que contem 'checkpoints'.
+
+    O Kaggle monta o Dataset em caminhos que variam (com/sem subpastas extras),
+    entao em vez de fixar o caminho, varremos /kaggle/input atras de uma pasta
+    'checkpoints' e usamos o pai dela como base. Retorna o caminho base ou "".
+    """
+    raiz = "/kaggle/input"
+    if not os.path.isdir(raiz):
+        return ""
+    for atual, dirs, _ in os.walk(raiz):
+        if os.path.basename(atual) == "checkpoints":
+            base = os.path.dirname(atual)
+            print(f">> Dataset detectado automaticamente: {base}")
+            return base
+    return ""
+
+
 def configurar_dataset():
     """Cria extra_model_paths.yaml apontando para o Dataset, se ele existir.
 
@@ -98,9 +119,11 @@ def configurar_dataset():
     modelos grandes ficam no Dataset (persistente, fora dos 20 GB) e aparecem
     normalmente nos nos Load Checkpoint.
     """
-    if not os.path.isdir(DATASET_DIR):
-        print(f">> [info] Dataset nao anexado ({DATASET_DIR}). Seguindo so com o working.")
-        print(">>        (Anexe o Dataset de modelos ao notebook para usar os modelos grandes.)")
+    global DATASET_DIR
+    DATASET_DIR = detectar_dataset_base()
+    if not DATASET_DIR:
+        print(">> [info] Nenhum Dataset com 'checkpoints' encontrado em /kaggle/input.")
+        print(">>        Anexe o Dataset de modelos ao notebook (+ Add Input).")
         return
 
     # Estrutura esperada DENTRO do Dataset: checkpoints/, loras/, vae/, etc.
@@ -117,7 +140,7 @@ def configurar_dataset():
     destino = COMFY + "/extra_model_paths.yaml"
     with open(destino, "w", encoding="utf-8") as f:
         f.write(yaml)
-    print(f">> Dataset conectado: {DATASET_DIR} -> extra_model_paths.yaml")
+    print(f">> Dataset conectado via extra_model_paths.yaml")
     # lista o que tem no dataset (ajuda a conferir)
     ck = os.path.join(DATASET_DIR, "checkpoints")
     if os.path.isdir(ck):
@@ -130,21 +153,22 @@ def configurar_dataset():
 # Download sob demanda (para o WORKING — modelos pequenos / testes rapidos)
 # --------------------------------------------------------------------------- #
 def baixar_epicrealism_working():
-    """Baixa o epiCRealism para o working (so ~2 GB, cabe nos 20 GB).
+    """Baixa o epiCRealism para o working SOMENTE se ele nao estiver no Dataset.
 
-    Usado para APRENDER agora. Modelos grandes devem ir para o Dataset.
+    Se o modelo ja veio no Dataset (detectado em configurar_dataset), nao baixa
+    nada — o ComfyUI le direto do Dataset. So baixa no working como fallback.
     """
-    destino = CKPT_WORKING + "/epicrealism_naturalSinRC1VAE.safetensors"
+    nome = "epicrealism_naturalSinRC1VAE.safetensors"
+    # ja esta no Dataset? entao nao precisa baixar
+    if DATASET_DIR and os.path.exists(os.path.join(DATASET_DIR, "checkpoints", nome)):
+        print(">> epiCRealism ja esta no Dataset — nao baixa no working")
+        return
+    destino = CKPT_WORKING + "/" + nome
     if os.path.exists(destino):
         print(">> epiCRealism ja existe no working")
         return
-    if os.path.isdir(DATASET_DIR + "/checkpoints"):
-        # se ja estiver no Dataset, nao precisa baixar no working
-        if os.path.exists(DATASET_DIR + "/checkpoints/epicrealism_naturalSinRC1VAE.safetensors"):
-            print(">> epiCRealism ja esta no Dataset — nao baixa no working")
-            return
     if not CIVITAI_TOKEN:
-        print(">> [PULADO] epiCRealism: Secret CIVITAI_TOKEN ausente.")
+        print(">> [PULADO] epiCRealism: Secret CIVITAI_TOKEN ausente e nao esta no Dataset.")
         return
     os.makedirs(CKPT_WORKING, exist_ok=True)
     url = "https://civitai.com/api/download/models/143906?token=" + CIVITAI_TOKEN

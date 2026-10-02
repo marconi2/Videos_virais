@@ -128,5 +128,8 @@ def ui():
         f.write(yaml)
 
     # Sobe o ComfyUI escutando na porta 8188 (que o web_server expoe).
-    cmd = "cd /root/ComfyUI && python main.py --listen 0.0.0.0 --port 8188"
+    # --enable-cors-header '*' : libera CORS/CSP para o navegador carregar os
+    #   previews das imagens quando acessado por host REMOTO (.modal.run). Sem
+    #   isso, a imagem gera mas o preview nao aparece (bloqueio de CSP).
+    cmd = "cd /root/ComfyUI && python main.py --listen 0.0.0.0 --port 8188 --enable-cors-header '*'"
     subprocess.Popen(cmd, shell=True)

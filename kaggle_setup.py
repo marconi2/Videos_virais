@@ -91,6 +91,37 @@ def instalar_manager():
 
 
 # --------------------------------------------------------------------------- #
+# Custom nodes extras (fixos) — reinstalados a cada sessao, pois o working some.
+# Para ADICIONAR um node: coloque a URL do repositorio git na lista CUSTOM_NODES.
+# O setup faz git clone + instala requirements.txt + roda install.py (se houver).
+# --------------------------------------------------------------------------- #
+CUSTOM_NODES = [
+    "https://github.com/ltdrdata/ComfyUI-Inspire-Pack",
+    # adicione outros aqui, ex.:
+    # "https://github.com/ltdrdata/ComfyUI-Impact-Pack",
+]
+
+
+def instalar_custom_nodes():
+    cn_dir = COMFY + "/custom_nodes"
+    for url in CUSTOM_NODES:
+        nome = url.rstrip("/").split("/")[-1]
+        destino = os.path.join(cn_dir, nome)
+        if os.path.exists(destino):
+            print(f">> node ja existe: {nome}")
+            continue
+        print(f">> instalando node: {nome}")
+        run(["git", "clone", url, destino], check=True)
+        req = os.path.join(destino, "requirements.txt")
+        if os.path.exists(req):
+            run(["pip", "install", "-r", req], check=False)
+        inst = os.path.join(destino, "install.py")
+        if os.path.exists(inst):
+            run(["python", inst], check=False)
+        print(f">> node pronto: {nome}")
+
+
+# --------------------------------------------------------------------------- #
 # Apontar o ComfyUI para os modelos do Dataset (SEM copiar — read-only)
 # --------------------------------------------------------------------------- #
 def detectar_dataset_base():
@@ -223,6 +254,7 @@ def subir_servidor_e_tunel(cf):
 def main():
     instalar_comfyui()
     instalar_manager()
+    instalar_custom_nodes()     # nodes fixos (Inspire Pack etc.) — reinstala sempre
     configurar_dataset()        # aponta para o Dataset (modelos grandes), se anexado
     baixar_epicrealism_working()  # modelo leve para aprender agora
     cf = baixar_cloudflared()

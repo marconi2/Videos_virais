@@ -263,7 +263,9 @@ qualidade, avaliar:
 
 | Candidato | Destaque | VRAM aprox. | Observação |
 |-----------|----------|-------------|------------|
-| **Wan 2.2** (Alibaba) | Melhor da familia hoje; fotorrealismo superior | ~27 GB | Mesma linhagem do 2.1 → migração pequena no `app.py`. A100 80GB sobra. |
+| **Wan 2.2** (Alibaba) | Melhor da familia estavel; fotorrealismo superior | ~27 GB | Mesma linhagem do 2.1 → migração pequena no `app.py`. A100 80GB sobra. Upgrade SEGURO. |
+| **Wan 2.7** (Alibaba/Tongyi) | 4 modos num só: T2V + I2V + reference-to-video + video-to-video/edicao + audio nativo. Open-weight Apache 2.0. Suporte no ComfyUI. | A CONFIRMAR | CANDIDATO FORTE: pesos ABERTOS (roda no Modal) e pode UNIFICAR Rumo A e B num modelo so. Falta confirmar se cabe na A100 80GB. |
+| **Wan 3.0** (Alibaba) | Flagship: 1080p, clipes 30s, audio nativo, multi-referencia | >80 GB provavel | ARRISCADO: fontes DIVERGEM se os pesos sao abertos (uma diz "zero public weights" = so API) e pode NAO caber em 80GB. Verificar os DOIS antes. |
 | **HunyuanVideo 1.5** (Tencent) | Melhor qualidade/VRAM; roda em placa menor | ~14 GB | Poderia até baratear a GPU. |
 | **LTX-2 / LTX-2.5** (Lightricks) | Mais rápido, clipes longos, gera áudio junto | varia | Muda o pipeline (áudio nativo). |
 
@@ -272,9 +274,13 @@ Notas:
   nosso Modal; serve só como referência de qualidade a mirar. Specs de uma suposta
   "Seedance 2.5" não confirmadas (fontes documentam Seedance 1.0, menção a 2.0).
 - Nenhum open source empata 100% com os fechados top (Seedance/Sora/Veo/Kling), mas
-  Wan 2.2 e LTX-2.x já são descritos como rivalizando com Sora/Veo em realismo.
-- Recomendacao: manter Wan 2.1 por ora (instalado + validado); migrar para Wan 2.2
-  quando quiser upgrade — é a evolução natural e de menor esforço.
+  Wan 2.2/2.7 e LTX-2.x já são descritos como rivalizando com Sora/Veo em realismo.
+- **Wan 2.7 vs 3.0:** o 2.7 é open-weight CONFIRMADO (Apache 2.0) → roda no Modal e
+  unifica I2V + motion transfer + swap + audio num modelo so; o 3.0 tem pesos
+  DUVIDOSOS (pode ser só API) e provavelmente exige >80 GB. Para A100 80GB + pesos
+  abertos: 2.2 = alvo seguro, 2.7 = alvo ambicioso (confirmar VRAM), 3.0 = observar.
+- Recomendacao: manter Wan 2.1 por ora (instalado + validado); upgrade seguro = Wan
+  2.2; upgrade ambicioso = Wan 2.7. Confirmar VRAM real na A100 antes de 2.7/3.0.
 
 ### Dois rumos futuros (DECIDIDO fazer após validar a config atual)
 
@@ -388,13 +394,28 @@ intercambiáveis no mesmo grafo).
 Pré-requisitos: conta Kaggle com telefone verificado (libera GPU); token de leitura
 do HuggingFace; aceitar a licença do FLUX.1-dev no HF (uma vez).
 
-Limitação-chave do Kaggle: `/kaggle/working` é APAGADO ao desligar a sessão. Nada
-persiste sozinho. Soluções: (a) rodar a célula única de setup a cada sessão (rebaixa
-~17 GB, alguns min); (b) futuramente, salvar modelos como Kaggle Dataset (storage
-permanente, anexado ao notebook, carrega instantâneo). Adotado (a) por ora.
+Limitação-chave do Kaggle: `/kaggle/working` é APAGADO ao desligar a sessão E tem
+só ~20 GB. Modelos grandes não cabem nem persistem ali.
 
-Modelo usado: Flux.1-dev FP8 (checkpoint único all-in-one, repo `Comfy-Org/flux1-dev`),
-que cabe nos ~15 GB da T4. Se faltar VRAM, cair para Flux GGUF Q4 (~6-8 GB).
+SOLUÇÃO ADOTADA (implementada e funcionando) — Kaggle Dataset:
+- Modelos ficam num **Kaggle Dataset** (`comfyui-models`), montado em `/kaggle/input/`
+  — PERSISTENTE, fora dos 20 GB do working, read-only, carrega instantâneo.
+- O `kaggle_setup.py` DETECTA o Dataset automaticamente (procura a pasta `checkpoints`
+  dentro de `/kaggle/input`, independente do caminho exato) e gera um
+  `extra_model_paths.yaml` apontando o ComfyUI para lá. Modelos aparecem no Load
+  Checkpoint SEM ocupar o working.
+- Estrutura dentro do Dataset: `checkpoints/`, `loras/`, `vae/`, `clip/`, `unet/`,
+  `controlnet/`, `upscale_models/` (uma pasta por tipo).
+- Tokens (`HF_TOKEN`, `CIVITAI_TOKEN`) ficam nos **Secrets do Kaggle** (Add-ons >
+  Secrets), lidos via `UserSecretsClient` — nunca em célula nem no GitHub.
+- Validado: epiCRealism no Dataset → ComfyUI lê de lá, working livre.
+
+Para ADICIONAR modelos: baixar numa estrutura `comfyui-models/<tipo>/arquivo` e
+atualizar o Dataset (New Version ou Notebook Output). O script detecta sozinho.
+
+Modelo de aprendizado: epiCRealism (SD 1.5, ~2 GB) no Dataset. Para Flux FP8
+(~17 GB) e outros grandes, mesma estratégia (Dataset). Wan 14B de vídeo NÃO roda na
+T4 — continua só no Modal.
 
 ## V-futuro — narração: avaliar F5-TTS PT-BR (registrado)
 

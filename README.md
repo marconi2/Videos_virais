@@ -417,6 +417,47 @@ Modelo de aprendizado: epiCRealism (SD 1.5, ~2 GB) no Dataset. Para Flux FP8
 (~17 GB) e outros grandes, mesma estratégia (Dataset). Wan 14B de vídeo NÃO roda na
 T4 — continua só no Modal.
 
+## Laboratório de aprendizado 2 — ComfyUI interativo na T4 do Modal (DECIDIDO/ATUAL)
+
+Após o ban do Kaggle (conteúdo NSFW de um prompt sem negative), migramos o
+aprendizado para o **Modal**, usando os **US$ 30/mês de crédito grátis**. Vantagens:
+sem risco de ban por conteúdo (Modal é infra, não policia como o Kaggle); mesmo
+ambiente da produção; Volume persistente (modelos não rebaixam).
+
+Arquivo: `modal_app/comfyui.py` — ComfyUI INTERATIVO na T4 via `@modal.web_server(8188)`.
+
+CUSTO (entender bem): aqui o ComfyUI roda DENTRO da T4 (~US$ 0,59/h), então paga-se
+a GPU o TEMPO TODO que a UI está aberta (montando workflow, pensando, gerando), NÃO
+só na geração. US$ 30 ÷ 0,59 ≈ ~50h/mês. Freios embutidos: `scaledown_window=60`
+(cai 60s após ociosidade), `timeout=3600` (máx 1h/sessão), `max_containers=1`.
+DISCIPLINA: fechar e `modal app stop` ao terminar.
+
+Dica para esticar o crédito: montar/entender workflows no ComfyUI LOCAL (PC, grátis)
+e usar a T4 do Modal só quando for realmente gerar.
+
+Uso:
+```
+# 1) criar o Secret do Civitai no Modal (uma vez):
+modal secret create civitai CIVITAI_TOKEN=sua_chave_civitai
+
+# 2) baixar o epiCRealism para o Volume (uma vez; CPU, barato):
+modal run modal_app/comfyui.py::download_epicrealism
+
+# 3) subir o ComfyUI interativo (abre uma URL web):
+modal serve modal_app/comfyui.py
+
+# 4) ao terminar, DESLIGAR (nao faturar parado):
+modal app stop comfyui-aprendizado
+```
+
+Modelos ficam no Volume `videos-virais-modelos`, subpasta `/vol/comfyui/<tipo>/`
+(checkpoints, loras, vae, ...). O ComfyUI lê de lá via `extra_model_paths.yaml`.
+GPU trocável para L4 (24 GB, ~US$ 0,80/h) quando testar Flux (T4 fica apertada).
+
+NOTA sobre multiplas contas: usar APENAS 1 conta Modal (os termos proíbem múltiplas
+contas para ganhar mais crédito; risco de perder a conta principal com o projeto).
+Se os US$ 30 acabarem, plano B = Lightning AI (80h/mês grátis).
+
 ## V-futuro — narração: avaliar F5-TTS PT-BR (registrado)
 
 Hoje a narração usa **edge-tts** (LOCAL, CPU, grátis, vozes prontas da Microsoft —

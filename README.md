@@ -417,46 +417,53 @@ Modelo de aprendizado: epiCRealism (SD 1.5, ~2 GB) no Dataset. Para Flux FP8
 (~17 GB) e outros grandes, mesma estratégia (Dataset). Wan 14B de vídeo NÃO roda na
 T4 — continua só no Modal.
 
-## Laboratório de aprendizado 2 — ComfyUI interativo na T4 do Modal (DECIDIDO/ATUAL)
+## Laboratório de aprendizado 2 — ComfyUI LOCAL + geração no Modal (SOLUÇÃO FINAL/ATUAL)
 
-Após o ban do Kaggle (conteúdo NSFW de um prompt sem negative), migramos o
-aprendizado para o **Modal**, usando os **US$ 30/mês de crédito grátis**. Vantagens:
-sem risco de ban por conteúdo (Modal é infra, não policia como o Kaggle); mesmo
-ambiente da produção; Volume persistente (modelos não rebaixam).
+Após o ban do Kaggle (NSFW), migramos o aprendizado para o Modal (US$ 30/mês grátis).
 
-Arquivo: `modal_app/comfyui.py` — ComfyUI INTERATIVO na T4 via `@modal.web_server(8188)`.
+HISTÓRICO (o que NÃO funcionou e por quê): a primeira tentativa foi rodar o ComfyUI
+INTEIRO na T4 do Modal e acessar via navegador (`@modal.web_server`). O backend
+gerava as imagens, mas o PREVIEW nos nós NÃO aparecia. Causa confirmada: o frontend
+novo do ComfyUI usa caminhos ABSOLUTOS nas chamadas de API, que quebram atras de
+proxy reverso (`.modal.run`) — ComfyUI issue #14455. A requisição `/view` nunca era
+disparada. Fixar frontend antigo não resolveu (e desatualizava a versão do curso).
 
-CUSTO (entender bem): aqui o ComfyUI roda DENTRO da T4 (~US$ 0,59/h), então paga-se
-a GPU o TEMPO TODO que a UI está aberta (montando workflow, pensando, gerando), NÃO
-só na geração. US$ 30 ÷ 0,59 ≈ ~50h/mês. Freios embutidos: `scaledown_window=60`
-(cai 60s após ociosidade), `timeout=3600` (máx 1h/sessão), `max_containers=1`.
-DISCIPLINA: fechar e `modal app stop` ao terminar.
+SOLUÇÃO QUE FUNCIONOU — ComfyUI LOCAL + custom node que delega a geração ao Modal:
+- Usa o custom node **`JunnnnyWon/comfyui-modal`** (MIT), instalado no ComfyUI local.
+- O ComfyUI roda no PC (versão ATUAL, a do curso) → interface e PREVIEW funcionam
+  100% (local, sem proxy no meio).
+- O node INTERCEPTA o "Queue Prompt", manda a geração para a T4 do Modal, recebe a
+  imagem de volta e salva em `output/` local → o preview aparece normalmente.
+- A GPU do Modal só liga NA geração e desliga em ~2s (`scaledown_window=2`,
+  `min_containers=0`). Entre gerações: custo ZERO. Cold start de 1-3 min na primeira
+  geração após pausa (preço de não pagar parado).
 
-Dica para esticar o crédito: montar/entender workflows no ComfyUI LOCAL (PC, grátis)
-e usar a T4 do Modal só quando for realmente gerar.
-
-Uso:
+Instalação (feita):
 ```
-# 1) criar o Secret do Civitai no Modal (uma vez):
-modal secret create civitai CIVITAI_TOKEN=sua_chave_civitai
-
-# 2) baixar o epiCRealism para o Volume (uma vez; CPU, barato):
-modal run modal_app/comfyui.py::download_epicrealism
-
-# 3) subir o ComfyUI interativo (abre uma URL web):
-modal serve modal_app/comfyui.py
-
-# 4) ao terminar, DESLIGAR (nao faturar parado):
-modal app stop comfyui-aprendizado
+cd C:\ComfyUI\ComfyUI\custom_nodes
+git clone https://github.com/JunnnnyWon/comfyui-modal
+C:\ComfyUI\python_embeded\python.exe -m pip install modal
 ```
 
-Modelos ficam no Volume `videos-virais-modelos`, subpasta `/vol/comfyui/<tipo>/`
-(checkpoints, loras, vae, ...). O ComfyUI lê de lá via `extra_model_paths.yaml`.
-GPU trocável para L4 (24 GB, ~US$ 0,80/h) quando testar Flux (T4 fica apertada).
+Uso no dia a dia:
+1. Inicia o ComfyUI local: `C:\ComfyUI\run_cpu.bat` (GPU Intel; a geração vai pro Modal).
+2. Abre `localhost:8188`, clica no ícone de nuvem → aba **"Modal GPU"**.
+3. Confirma: modo **Cloud (Modal GPU)**, GPU **T4**, e **"Ready to generate"**
+   (clica "Wake Up" / "Check Status" se estiver dormindo).
+4. Modelos: aba Modal GPU → **Add Model** → URL do Civitai/HF → Download (vai para o
+   Volume `comfyui-models` do node). epiCRealism já baixado.
+5. Monta o workflow e **Queue Prompt** → gera na T4, imagem volta e aparece no preview.
 
-NOTA sobre multiplas contas: usar APENAS 1 conta Modal (os termos proíbem múltiplas
-contas para ganhar mais crédito; risco de perder a conta principal com o projeto).
-Se os US$ 30 acabarem, plano B = Lightning AI (80h/mês grátis).
+Custo: a T4 (~US$ 0,30/h no node) só roda durante a geração. Montar workflow/pensar
+é local (grátis). Confirmado na pratica: "Sleeping when idle".
+
+Token Modal: o node lê o `~/.modal.toml` (profile já autenticado, `ak-...`). Token
+do Civitai/HF ficam na config do node (sidebar). 1 conta Modal só (termos proíbem
+múltiplas). Plano B se os US$ 30 acabarem: Lightning AI (80h/mês grátis).
+
+NOTA: o `modal_app/comfyui.py` (abordagem antiga, ComfyUI inteiro na T4 via
+web_server) fica no repo como histórico, mas NÃO é mais o caminho — o preview não
+funcionava atras do proxy. A solução atual é o ComfyUI LOCAL + node acima.
 
 ## V-futuro — narração: avaliar F5-TTS PT-BR (registrado)
 

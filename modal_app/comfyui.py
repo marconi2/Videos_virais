@@ -41,6 +41,11 @@ image = (
     .run_commands("comfy --skip-prompt install --nvidia")
     # ComfyUI-Manager (gerenciar nodes pela UI)
     .run_commands("comfy node install comfyui-manager")
+    # FIX do preview atras de proxy reverso (.modal.run):
+    # o frontend NOVO usa caminhos ABSOLUTOS nas chamadas de API, o que quebra o
+    # preview atras de proxy (ComfyUI issue #14455). Fixar um frontend mais ANTIGO
+    # (caminhos compativeis com proxy) faz o preview voltar a funcionar.
+    .pip_install("comfyui-frontend-package==1.26.13")
 )
 
 
